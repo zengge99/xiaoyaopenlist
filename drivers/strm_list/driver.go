@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	// 关键1：导入SQLite3驱动，下划线表示仅注册驱动不直接使用
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/OpenListTeam/OpenList/v4/internal/driver"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/OpenList/v4/internal/op"
@@ -22,7 +24,7 @@ import (
 // 驱动配置项 - 保留原核心配置
 type Addition struct {
 	TxtPath string `json:"txt_path" config:"strm.txt 路径" default:"/index/strm/strm.txt" help:"strm.txt 的绝对路径"`
-	DbPath  string `json:"db_path" config:"数据库存放路径" default:"/opt/alist/strm/strm.db" help:"SQLite 数据库文件的绝对路径"`
+	DbPath  string `json:"db_path" config:"数据库存放路径" default:"/opt/openlist/strm.db" help:"SQLite 数据库文件的绝对路径（建议放openlist目录，避免权限问题）"`
 }
 
 // 驱动配置元数据 - 框架要求的基础配置
@@ -55,33 +57,45 @@ func (d *StrmList) GetStorage() *model.Storage {
 	return &d.Storage
 }
 
-// 驱动初始化 - 保留原逻辑，无修改
+// 驱动初始化 - 修正SQLite连接串（sqlite→sqlite3），补全连接测试
 func (d *StrmList) Init(ctx context.Context) error {
 	if d.DbPath == "" || d.TxtPath == "" {
-		return nil
+		return fmt.Errorf("strm.txt路径和数据库路径不能为空")
 	}
-	// 确保数据库目录存在
-	if err := os.MkdirAll(filepath.Dir(d.DbPath), 0755); err != nil {
+	// 确保数据库目录存在，赋予可写权限
+	dir := filepath.Dir(d.DbPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("创建DB目录失败: %v", err)
 	}
-	// 打开SQLite数据库（内置驱动+性能参数）
+	// 关键2：驱动名改为sqlite3（go-sqlite3标准驱动名），保留性能参数
+	dsn := d.DbPath + "?_pragma=journal_mode(OFF)&_pragma=synchronous(OFF)&_pragma=cache_size=-10000"
 	var err error
-	d.db, err = sql.Open("sqlite", d.DbPath+"?_pragma=journal_mode(OFF)&_pragma=synchronous(OFF)")
+	d.db, err = sql.Open("sqlite3", dsn)
 	if err != nil {
 		return fmt.Errorf("打开SQLite失败: %v", err)
 	}
+	// 关键补充：测试数据库连接（sql.Open仅创建连接池，不实际连接）
+	if err := d.db.Ping(); err != nil {
+		d.db.Close()
+		return fmt.Errorf("SQLite连接测试失败: %v", err)
+	}
+	// 设置连接池参数，避免连接耗尽
+	d.db.SetMaxOpenConns(1) // SQLite单文件建议最大1个连接
+	d.db.SetMaxIdleConns(1)
 	// 初始化表结构和索引
-	_, err = d.db.Exec(`
-		CREATE TABLE IF NOT EXISTS nodes (
-			id INTEGER PRIMARY KEY,
-			name TEXT,
-			parent_id INTEGER,
-			is_dir BOOLEAN,
-			content TEXT
-		);
-		CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);
-	`)
+	createTableSQL := `
+	CREATE TABLE IF NOT EXISTS nodes (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		name TEXT NOT NULL,
+		parent_id INTEGER NOT NULL DEFAULT 0,
+		is_dir BOOLEAN NOT NULL DEFAULT 0,
+		content TEXT NOT NULL DEFAULT ''
+	);
+	CREATE INDEX IF NOT EXISTS idx_parent_name ON nodes(parent_id, name);
+	`
+	_, err = d.db.Exec(createTableSQL)
 	if err != nil {
+		d.db.Close()
 		return fmt.Errorf("初始化表结构失败: %v", err)
 	}
 	// 空库时异步导入strm.txt
@@ -90,14 +104,18 @@ func (d *StrmList) Init(ctx context.Context) error {
 	if count <= 1 {
 		go d.importTxtTask()
 	}
+	log.Infof("StrmList驱动初始化成功，数据库：%s，strm.txt：%s", d.DbPath, d.TxtPath)
 	return nil
 }
 
 // 驱动销毁：释放DB连接
 func (d *StrmList) Drop(ctx context.Context) error {
 	if d.db != nil {
-		return d.db.Close()
+		if err := d.db.Close(); err != nil {
+			log.Warnf("关闭SQLite连接失败: %v", err)
+		}
 	}
+	log.Infof("StrmList驱动已销毁")
 	return nil
 }
 
@@ -232,9 +250,14 @@ func (d *StrmList) findNodeByPath(path string) (id int64, isDir bool, content st
 	return id, isDir, content, nil
 }
 
-// 异步导入strm.txt - 保留原高效逻辑，事务+预编译+目录缓存
+// 异步导入strm.txt - 保留原高效逻辑，事务+预编译+目录缓存，增加错误日志
 func (d *StrmList) importTxtTask() {
 	log.Infof("[StrmList] 开始从 %s 导入数据", d.TxtPath)
+	// 检查strm.txt文件是否存在
+	if _, err := os.Stat(d.TxtPath); os.IsNotExist(err) {
+		log.Errorf("[StrmList] strm.txt文件不存在: %s", d.TxtPath)
+		return
+	}
 	file, err := os.Open(d.TxtPath)
 	if err != nil {
 		log.Errorf("[StrmList] 打开strm.txt失败: %v", err)
@@ -248,9 +271,9 @@ func (d *StrmList) importTxtTask() {
 		log.Errorf("[StrmList] 开启事务失败: %v", err)
 		return
 	}
-	// 初始化根节点
+	// 初始化根节点（ID=0）
 	_, _ = tx.Exec("INSERT OR IGNORE INTO nodes (id, name, parent_id, is_dir) VALUES (0, '', -1, 1)")
-	// 预编译插入语句
+	// 预编译插入语句，提升批量导入速度
 	stmt, err := tx.Prepare("INSERT INTO nodes (name, parent_id, is_dir, content) VALUES (?, ?, ?, ?)")
 	if err != nil {
 		log.Errorf("[StrmList] 预编译语句失败: %v", err)
@@ -264,19 +287,24 @@ func (d *StrmList) importTxtTask() {
 	scanner.Buffer(make([]byte, 64*1024), 10*1024*1024) // 大缓冲区支持超长行
 
 	count := 0
+	skipCount := 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
+			skipCount++
 			continue
 		}
-		// 按#分割路径和内容，格式：路径#strm_URL
+		// 按#分割路径和内容，格式：路径#strm_URL（严格校验格式）
 		parts := strings.SplitN(line, "#", 2)
-		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		if len(parts) < 2 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[1]) == "" {
+			log.Warnf("[StrmList] 行格式错误，跳过: %s", line)
+			skipCount++
 			continue
 		}
-		rawPath, content := strings.Trim(parts[0], "/"), parts[1]
+		rawPath, content := strings.Trim(parts[0], "/"), strings.TrimSpace(parts[1])
 		pathParts := strings.Split(rawPath, "/")
 		if len(pathParts) == 0 {
+			skipCount++
 			continue
 		}
 
@@ -284,42 +312,61 @@ func (d *StrmList) importTxtTask() {
 		var currParent int64 = 0
 		currPathAcc := ""
 		for _, part := range pathParts[:len(pathParts)-1] {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
 			if currPathAcc == "" {
 				currPathAcc = part
 			} else {
 				currPathAcc += "/" + part
 			}
+			// 缓存命中，直接使用父节点ID
 			if id, ok := dirCache[currPathAcc]; ok {
 				currParent = id
 				continue
 			}
-			// 插入目录节点
+			// 缓存未命中，插入目录节点
 			res, err := tx.Exec("INSERT INTO nodes (name, parent_id, is_dir) VALUES (?, ?, 1)", part, currParent)
-			if err == nil {
-				currParent, _ = res.LastInsertId()
-				dirCache[currPathAcc] = currParent
+			if err != nil {
+				log.Warnf("[StrmList] 创建目录[%s]失败: %v", currPathAcc, err)
+				continue
 			}
+			// 获取新插入目录的ID，加入缓存
+			dirID, err := res.LastInsertId()
+			if err != nil {
+				log.Warnf("[StrmList] 获取目录ID失败: %v", err)
+				continue
+			}
+			currParent = dirID
+			dirCache[currPathAcc] = dirID
 		}
-		// 插入strm文件节点
-		if _, err := stmt.Exec(pathParts[len(pathParts)-1], currParent, 0, content); err == nil {
+		// 插入strm文件节点（最后一个路径段为文件名）
+		filename := strings.TrimSpace(pathParts[len(pathParts)-1])
+		if filename == "" {
+			skipCount++
+			continue
+		}
+		if _, err := stmt.Exec(filename, currParent, 0, content); err == nil {
 			count++
-			if count%100000 == 0 {
-				log.Infof("[StrmList] 导入中：已处理 %d 条", count)
-			}
+		} else {
+			log.Warnf("[StrmList] 插入文件[%s]失败: %v", rawPath, err)
+			skipCount++
 		}
 	}
 
-	// 检查扫描错误并提交事务
+	// 检查扫描错误并提交/回滚事务
 	if err := scanner.Err(); err != nil {
-		log.Errorf("[StrmList] 扫描文件失败: %v", err)
+		log.Errorf("[StrmList] 扫描strm.txt文件失败: %v", err)
 		_ = tx.Rollback()
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		log.Errorf("[StrmList] 提交事务失败: %v", err)
+		log.Errorf("[StrmList] 提交导入事务失败: %v", err)
+		_ = tx.Rollback()
 		return
 	}
-	log.Infof("[StrmList] 导入完成，有效记录: %d 条", count)
+	log.Infof("[StrmList] 导入完成！成功导入%d条，跳过%d条", count, skipCount)
 }
 
 // 驱动注册：框架标准方式

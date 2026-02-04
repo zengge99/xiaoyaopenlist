@@ -24,7 +24,7 @@ import (
 // 驱动配置项 - 保留原核心配置
 type Addition struct {
 	TxtPath string `json:"txt_path" config:"strm.txt 路径" default:"/index/strm/strm.txt" help:"strm.txt 的绝对路径"`
-	DbPath  string `json:"db_path" config:"数据库存放路径" default:"/opt/openlist/strm.db" help:"SQLite 数据库文件的绝对路径（建议放openlist目录，避免权限问题）"`
+	DbPath  string `json:"db_path" config:"数据库存放路径" default:"/opt/openlist/strm.db" help:"SQLite 数据库文件的绝对路径"`
 }
 
 // 驱动配置元数据 - 框架要求的基础配置
